@@ -1,7 +1,40 @@
+export interface UserAgentBrandVersion {
+  brand: string;
+  version: string;
+}
+
+export interface UserAgentMetadata {
+  brands?: UserAgentBrandVersion[];
+  fullVersionList?: UserAgentBrandVersion[];
+  platform?: string;
+  platformVersion?: string;
+  architecture?: string;
+  model?: string;
+  mobile?: boolean;
+  bitness?: string;
+  wow64?: boolean;
+  formFactors?: string[];
+}
+
+export interface BrowserProfile {
+  userAgent: string;
+  acceptLanguage?: string;
+  platform?: string;
+  userAgentMetadata?: UserAgentMetadata;
+  viewport?: {
+    width: number;
+    height: number;
+    deviceScaleFactor?: number;
+    mobile?: boolean;
+    screenWidth?: number;
+    screenHeight?: number;
+  };
+}
+
 export interface UAPlugin {
   name: string;
   match(url: string): boolean;
-  getUserAgent(url: string): string;
+  getProfile(url: string): BrowserProfile;
 }
 
 class UAPluginRegistry {
@@ -11,10 +44,10 @@ class UAPluginRegistry {
     this.plugins.push(plugin);
   }
 
-  resolve(url: string): string | null {
+  resolve(url: string): BrowserProfile | null {
     for (const plugin of this.plugins) {
       if (plugin.match(url)) {
-        return plugin.getUserAgent(url);
+        return plugin.getProfile(url);
       }
     }
     return null;

@@ -1,5 +1,5 @@
 import type { UAPlugin } from "../registry";
-import { UA_PRESETS } from "../presets";
+import { BROWSER_PROFILES } from "../presets";
 
 const WECHAT_DOMAINS = [
   "mp.weixin.qq.com",
@@ -18,8 +18,8 @@ const wechatPlugin: UAPlugin = {
       return false;
     }
   },
-  getUserAgent(_url: string): string {
-    return UA_PRESETS.iPhone_WebView;
+  getProfile(_url: string) {
+    return BROWSER_PROFILES.wechatIPhone;
   },
 };
 

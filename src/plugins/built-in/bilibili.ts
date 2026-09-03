@@ -1,5 +1,5 @@
 import type { UAPlugin } from "../registry";
-import { UA_PRESETS } from "../presets";
+import { BROWSER_PROFILES } from "../presets";
 
 const BILIBILI_DOMAINS = [
   "www.bilibili.com",
@@ -20,8 +20,8 @@ const bilibiliPlugin: UAPlugin = {
       return false;
     }
   },
-  getUserAgent(_url: string): string {
-    return UA_PRESETS.Desktop_Chrome;
+  getProfile(_url: string) {
+    return BROWSER_PROFILES.bilibiliDesktop;
   },
 };
 

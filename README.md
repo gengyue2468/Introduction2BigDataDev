@@ -21,7 +21,9 @@ curl -X POST http://localhost:9233/read \
   -d '{"url":"https://www.gengyue.site"}'
 ```
 
-需要在服务端安装 chromium 或者 chrome 或者 edge 并暴露 cdp 调试端口
+需要在服务端安装 chromium、chrome 或者 edge，并在 `127.0.0.1:9222` 暴露 CDP 调试端口。挑战页会在同一个浏览器会话中等待最多 300 秒，验证自然完成后再提取页面；不会自动处理需要交互的验证码。
+
+默认启用内置站点兼容性 UA profile；设置 `ENABLE_UA_OVERRIDE=false` 可关闭。微信 profile 同时调整语言、Client Hints 和移动视口，不只是替换 UA 字符串。
 
 效果类似：
 
