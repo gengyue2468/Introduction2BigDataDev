@@ -729,11 +729,26 @@ function getLegacyGetURL(c: any): string {
   return `${target}${target.includes("?") ? "&" : "?"}${targetParams}`;
 }
 
+function getExplicitGetURL(c: any): string {
+  const target = c.req.query("url") || "";
+  const requestURL = new URL(c.req.url);
+  const targetParams = new URLSearchParams();
+
+  requestURL.searchParams.forEach((value, key) => {
+    if (key !== "url" && !SERVICE_QUERY_PARAMS.has(key)) {
+      targetParams.append(key, value);
+    }
+  });
+
+  if (!targetParams.size) return target;
+  return `${target}${target.includes("?") ? "&" : "?"}${targetParams}`;
+}
+
 app.get("/read", async (c) => {
   if (!method.allowGet) {
     return c.json({ error: "Method Not Allowed" }, 405);
   }
-  return readPage(c, c.req.query("url") || "");
+  return readPage(c, getExplicitGetURL(c));
 });
 
 app.get("/*", (c) => {
