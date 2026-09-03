@@ -35,6 +35,7 @@ const DEFAULT_CHALLENGE_WAIT_MS = 300_000;
 const CHALLENGE_POLL_MS = 1_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 480_000;
 const MAX_REQUEST_TIMEOUT_MS = 600_000;
+const NETWORK_IDLE_MAX_WAIT_MS = 5_000;
 const MAX_CONCURRENT_READS = Math.max(
   1,
   Math.min(16, Number(Bun.env.MAX_CONCURRENT_READS) || 2),
@@ -511,12 +512,16 @@ async function readPage(c: any, url: string) {
       ) {
         throw new Error("Unsafe navigation target");
       }
+      const networkIdleWaitMs = Math.min(
+        maxWaitMs,
+        NETWORK_IDLE_MAX_WAIT_MS,
+      );
       await withTimeout(
         networkIdleTracker!.wait(
           stableWindowMs,
-          remainingTime(deadlineAt, maxWaitMs, "network idle"),
+          remainingTime(deadlineAt, networkIdleWaitMs, "network idle"),
         ),
-        remainingTime(deadlineAt, maxWaitMs, "network idle"),
+        remainingTime(deadlineAt, networkIdleWaitMs, "network idle"),
         "network idle",
         () => view.close(),
       );
@@ -527,29 +532,29 @@ async function readPage(c: any, url: string) {
 
       while (true) {
         const elapsed = Date.now() - pollStarted;
-        if (
-          elapsed >= maxWaitMs ||
-          Date.now() >= deadlineAt
-        ) {
+        if (elapsed >= maxWaitMs || Date.now() >= deadlineAt) {
           partial = true;
           break;
         }
 
-        const contentLen = await withTimeout(
-          view.evaluate<number>("document.body?.innerText?.length ?? 0"),
+        const contentState = await withTimeout(
+          view.evaluate<{ contentLen: number; readyState: string }>(
+            "({ contentLen: document.body?.innerText?.length ?? 0, readyState: document.readyState })",
+          ),
           remainingTime(deadlineAt, 5000, "content check"),
           "content check",
           () => view.close(),
         );
 
-        if (contentLen > 100) {
-          if (contentLen === lastLen) {
-            stableCount++;
-            if (stableCount >= stableThreshold) break;
-          } else {
-            stableCount = 0;
-            lastLen = contentLen;
-          }
+        if (
+          contentState.readyState === "complete" &&
+          contentState.contentLen === lastLen
+        ) {
+          stableCount++;
+          if (stableCount >= stableThreshold) break;
+        } else {
+          stableCount = 0;
+          lastLen = contentState.contentLen;
         }
 
         await new Promise((r) => setTimeout(r, stableWindowMs));

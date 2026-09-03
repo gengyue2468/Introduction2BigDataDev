@@ -8,9 +8,9 @@ export interface UserAgentMetadata {
   fullVersionList?: UserAgentBrandVersion[];
   platform?: string;
   platformVersion?: string;
-  architecture?: string;
-  model?: string;
-  mobile?: boolean;
+  architecture: string;
+  model: string;
+  mobile: boolean;
   bitness?: string;
   wow64?: boolean;
   formFactors?: string[];

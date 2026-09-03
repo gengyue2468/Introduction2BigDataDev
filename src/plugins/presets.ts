@@ -21,6 +21,7 @@ export const BROWSER_PROFILES: Record<string, BrowserProfile> = {
       fullVersionList: [],
       platform: "iOS",
       platformVersion: "17.4",
+      architecture: "arm",
       model: "iPhone",
       mobile: true,
     },
