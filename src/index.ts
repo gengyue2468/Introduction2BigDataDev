@@ -4,7 +4,10 @@ import {
   isValidURL,
   normalizeInputURL,
 } from "./lib/valid";
-import { getBrowserDebuggingURL } from "./lib/browser";
+import {
+  BROWSER_CONNECTION_TIMEOUT_MS,
+  getBrowserDebuggingURL,
+} from "./lib/browser";
 import { htmlParser } from "./lib/parser";
 import {
   startNetworkIdleTracking,
@@ -12,6 +15,24 @@ import {
 } from "./lib/network-idle";
 
 import { pluginRegistry, type BrowserProfile } from "./plugins";
+import {
+  buildJdItemURL,
+  extractJdItem,
+  normalizeSkuId,
+  type JdItem,
+  type JdItemResult,
+} from "./lib/jd";
+import {
+  buildTaobaoItemURL,
+  extractTaobaoItem,
+  normalizeTaobaoItemId,
+  type TaobaoItem,
+  type TaobaoItemResult,
+} from "./lib/taobao";
+import { resolve } from "node:path";
+import { DashboardStore } from "./dashboard/store";
+import { DashboardQueue } from "./dashboard/queue";
+import { createDashboardAPI } from "./dashboard/api";
 
 const authMiddleware: MiddlewareHandler = async (c, next) => {
   const authorization = c.req.header("Authorization");
@@ -39,6 +60,16 @@ const NETWORK_IDLE_MAX_WAIT_MS = 5_000;
 const MAX_CONCURRENT_READS = Math.max(
   1,
   Math.min(16, Number(Bun.env.MAX_CONCURRENT_READS) || 2),
+);
+const MAX_JD_BATCH_SIZE = 20;
+const JD_BATCH_CONCURRENCY = Math.max(
+  1,
+  Math.min(MAX_CONCURRENT_READS, Number(Bun.env.JD_BATCH_CONCURRENCY) || 1),
+);
+const MAX_TAOBAO_BATCH_SIZE = 20;
+const TAOBAO_BATCH_CONCURRENCY = Math.max(
+  1,
+  Math.min(MAX_CONCURRENT_READS, Number(Bun.env.TAOBAO_BATCH_CONCURRENCY) || 1),
 );
 
 let activeReads = 0;
@@ -114,14 +145,12 @@ async function withTimeout<T>(
 }
 
 function parseQueryNumber(
-  c: any,
-  name: string,
+  raw: string | undefined,
   fallback: number,
   min: number,
   max: number,
   integer = false,
 ): number | null {
-  const raw = c.req.query(name);
   if (raw === undefined) return fallback;
 
   const value = Number(raw);
@@ -151,6 +180,36 @@ function getCurrentURL(view: Bun.WebView, fallback: string) {
   } catch {
     return fallback;
   }
+}
+
+class RequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "RequestError";
+  }
+}
+
+interface PageSnapshot {
+  title: string;
+  description: string;
+  pageMeta: {
+    siteName: string;
+    pageType: string;
+    publishedTime: string;
+    modifiedTime: string;
+    keywords: string;
+    section: string;
+    canonicalUrl: string;
+  };
+  authors: string[];
+  html: string;
+  text: string;
+  normalizedUrl: string;
+  finalUrl: string;
+  partial: boolean;
 }
 
 async function applyBrowserProfile(
@@ -225,6 +284,7 @@ function logNavigationDiagnostics(
   finalURL: string,
   diagnostics: ReadDiagnostics,
   partial: boolean,
+  kind = "read",
 ) {
   const describeURL = (value: string) => {
     try {
@@ -236,7 +296,7 @@ function logNavigationDiagnostics(
   };
 
   console.info(
-    "[read]",
+    `[${kind}]`,
     JSON.stringify({
       target: describeURL(targetURL),
       final: describeURL(finalURL),
@@ -370,34 +430,44 @@ async function navigateToURL(
   return false;
 }
 
-async function readPage(c: any, url: string) {
+interface CaptureOptions {
+  signal?: AbortSignal;
+  query?: (name: string) => string | undefined;
+}
+
+function captureOptionsFromRequest(c: any): CaptureOptions {
+  return { signal: c.req.raw.signal, query: (name) => c.req.query(name) };
+}
+
+async function capturePage(
+  url: string,
+  kind: "read" | "jd" | "taobao" = "read",
+  options: CaptureOptions = {},
+): Promise<PageSnapshot> {
+  options.signal?.throwIfAborted();
   if (typeof url !== "string" || !url) {
-    return c.json({ error: "似乎没看到 URL" }, 400);
+    throw new RequestError("似乎没看到 URL", 400);
   }
 
   const normalizedUrl = normalizeInputURL(url);
-
   if (!isValidURL(normalizedUrl)) {
-    return c.json({ error: "URL 无效欸" }, 400);
+    throw new RequestError("URL 无效欸", 400);
   }
-
   if (!(await isSafeNavigationURL(normalizedUrl))) {
-    return c.json({ error: "Unsafe URL" }, 400);
+    throw new RequestError("Unsafe URL", 400);
   }
 
-  const navigateMs = parseQueryNumber(c, "navigate_timeout", 20000, 1000, 120000);
-  const maxWaitMs = parseQueryNumber(c, "max_wait", 60000, 1000, 300000);
-  const stableWindowMs = parseQueryNumber(c, "stable_window", 200, 50, 5000);
+  const navigateMs = parseQueryNumber(options.query?.("navigate_timeout"), 20000, 1000, 120000);
+  const maxWaitMs = parseQueryNumber(options.query?.("max_wait"), 60000, 1000, 300000);
+  const stableWindowMs = parseQueryNumber(options.query?.("stable_window"), 200, 50, 5000);
   const requestTimeoutMs = parseQueryNumber(
-    c,
-    "request_timeout",
+    options.query?.("request_timeout"),
     DEFAULT_REQUEST_TIMEOUT_MS,
     1000,
     MAX_REQUEST_TIMEOUT_MS,
   );
   const stableThreshold = parseQueryNumber(
-    c,
-    "stable_threshold",
+    options.query?.("stable_threshold"),
     3,
     1,
     20,
@@ -411,13 +481,12 @@ async function readPage(c: any, url: string) {
     requestTimeoutMs === null ||
     stableThreshold === null
   ) {
-    return c.json({ error: "Invalid timeout parameter" }, 400);
+    throw new RequestError("Invalid timeout parameter", 400);
   }
 
   const releaseReadSlot = tryAcquireReadSlot();
   if (!releaseReadSlot) {
-    c.header("Retry-After", "5");
-    return c.json({ error: "Too many reads in progress" }, 429);
+    throw new RequestError("Too many reads in progress", 429);
   }
 
   const deadlineAt = Date.now() + requestTimeoutMs;
@@ -425,12 +494,16 @@ async function readPage(c: any, url: string) {
 
   try {
     let partial = false;
-
     const debuggingURL = await withTimeout(
       getBrowserDebuggingURL(),
-      remainingTime(deadlineAt, 5000, "browser connection"),
+      remainingTime(
+        deadlineAt,
+        BROWSER_CONNECTION_TIMEOUT_MS,
+        "browser connection",
+      ),
       "browser connection",
     );
+    options.signal?.throwIfAborted();
     const view = new Bun.WebView({
       backend: {
         type: "chrome",
@@ -438,12 +511,12 @@ async function readPage(c: any, url: string) {
       },
       headless: true,
     });
-    const requestSignal = c.req.raw.signal as AbortSignal;
+    const requestSignal = options.signal;
     const onRequestAbort = () => view.close();
     let cleanupDiagnostics = () => {};
     let networkIdleTracker: NetworkIdleTracker | null = null;
 
-    requestSignal.addEventListener("abort", onRequestAbort, { once: true });
+    requestSignal?.addEventListener("abort", onRequestAbort, { once: true });
 
     try {
       if (
@@ -512,10 +585,8 @@ async function readPage(c: any, url: string) {
       ) {
         throw new Error("Unsafe navigation target");
       }
-      const networkIdleWaitMs = Math.min(
-        maxWaitMs,
-        NETWORK_IDLE_MAX_WAIT_MS,
-      );
+
+      const networkIdleWaitMs = Math.min(maxWaitMs, NETWORK_IDLE_MAX_WAIT_MS);
       await withTimeout(
         networkIdleTracker!.wait(
           stableWindowMs,
@@ -557,26 +628,11 @@ async function readPage(c: any, url: string) {
           lastLen = contentState.contentLen;
         }
 
-        await new Promise((r) => setTimeout(r, stableWindowMs));
+        await new Promise((resolve) => setTimeout(resolve, stableWindowMs));
       }
 
       const pageSnapshot = await withTimeout(
-        view.evaluate<{
-          title: string;
-          description: string;
-          pageMeta: {
-            siteName: string;
-            pageType: string;
-            publishedTime: string;
-            modifiedTime: string;
-            keywords: string;
-            section: string;
-            canonicalUrl: string;
-          };
-          authors: string[];
-          html: string;
-          text: string;
-        }>(`(() => {
+        view.evaluate<Omit<PageSnapshot, "normalizedUrl" | "finalUrl" | "partial">>(`(() => {
           const meta = (selector) =>
             document.querySelector(selector)?.getAttribute("content") || "";
 
@@ -633,48 +689,134 @@ async function readPage(c: any, url: string) {
         () => view.close(),
       );
 
-      const { title, description, pageMeta, authors, html, text } = pageSnapshot;
-
-      /*
-       * All page data is collected in one evaluate call so metadata and HTML
-       * describe the same DOM state and cannot overlap on the WebView slot.
-       */
-
-      const rawText = (await htmlParser(url, html)) || text;
-      const frontmatter = buildFrontmatter(
-        title,
-        description,
-        pageMeta,
-        authors,
+      const finalUrl = getCurrentURL(view, normalizedUrl);
+      return {
+        ...pageSnapshot,
         normalizedUrl,
+        finalUrl,
         partial,
-      );
+      };
+    } finally {
+      networkIdleTracker?.close();
+      cleanupDiagnostics();
+      requestSignal?.removeEventListener("abort", onRequestAbort);
+      const finalURL = getCurrentURL(view, normalizedUrl);
+      logNavigationDiagnostics(normalizedUrl, finalURL, diagnostics, partial, kind);
+      view.close();
+    }
+  } finally {
+    releaseReadSlot();
+  }
+}
 
-      const finalText = `---
+function errorResponse(c: any, error: unknown, label: string) {
+  const message = error instanceof Error ? error.message : String(error);
+  const status = getErrorStatusCode(error);
+  if (status === 429) c.header("Retry-After", "5");
+  return c.json({ error: label, message }, status);
+}
+
+async function readPage(c: any, url: string) {
+  try {
+    const pageSnapshot = await capturePage(url, "read", captureOptionsFromRequest(c));
+    const { title, description, pageMeta, authors, html, text } = pageSnapshot;
+
+    /*
+     * All page data is collected in one evaluate call so metadata and HTML
+     * describe the same DOM state and cannot overlap on the WebView slot.
+     */
+    const rawText = (await htmlParser(pageSnapshot.normalizedUrl, html)) || text;
+    const frontmatter = buildFrontmatter(
+      title,
+      description,
+      pageMeta,
+      authors,
+      pageSnapshot.normalizedUrl,
+      pageSnapshot.partial,
+    );
+
+    const finalText = `---
 ${frontmatter.join("\n")}
 ---
 
 ${rawText}
-          `;
+      `;
 
-      return c.text(finalText);
-    } finally {
-      networkIdleTracker?.close();
-      cleanupDiagnostics();
-      requestSignal.removeEventListener("abort", onRequestAbort);
-      const finalURL = getCurrentURL(view, normalizedUrl);
-      logNavigationDiagnostics(normalizedUrl, finalURL, diagnostics, partial);
-      view.close();
-    }
+    return c.text(finalText);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return c.json(
-      { error: "抓取页面失败", message },
-      getErrorStatusCode(error),
-    );
-  } finally {
-    releaseReadSlot();
+    return errorResponse(c, error, "抓取页面失败");
   }
+}
+
+async function readJdItem(skuId: string, options: CaptureOptions = {}): Promise<JdItem> {
+  const sourceUrl = buildJdItemURL(skuId);
+  const pageSnapshot = await capturePage(sourceUrl, "jd", options);
+  return extractJdItem(pageSnapshot.html, skuId, sourceUrl);
+}
+
+async function readTaobaoItem(itemId: string, options: CaptureOptions = {}): Promise<TaobaoItem> {
+  const sourceUrl = buildTaobaoItemURL(itemId);
+  const pageSnapshot = await capturePage(
+    sourceUrl,
+    "taobao",
+    options,
+  );
+  return extractTaobaoItem(pageSnapshot.html, itemId, sourceUrl);
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+
+  async function worker() {
+    while (true) {
+      const index = cursor++;
+      if (index >= items.length) return;
+      results[index] = await mapper(items[index]);
+    }
+  }
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(Math.max(1, concurrency), items.length) },
+      () => worker(),
+    ),
+  );
+
+  return results;
+}
+
+function jdErrorResult(skuId: string, error: unknown): JdItemResult {
+  return {
+    sku_id: skuId,
+    item_name: "",
+    shop_name: "",
+    daily_price: null,
+    actual_price: null,
+    source_url: buildJdItemURL(skuId),
+    observed_at: new Date().toISOString(),
+    error: error instanceof Error ? error.message : String(error),
+  };
+}
+
+function taobaoErrorResult(
+  itemId: string,
+  error: unknown,
+): TaobaoItemResult {
+  return {
+    item_id: itemId,
+    item_name: "",
+    shop_name: "",
+    daily_price: null,
+    actual_price: null,
+    source_url: buildTaobaoItemURL(itemId),
+    observed_at: new Date().toISOString(),
+    error: error instanceof Error ? error.message : String(error),
+  };
 }
 
 app.get("/", (c) => {
@@ -682,8 +824,22 @@ app.get("/", (c) => {
   const postMethodIntro = method.allowPost
     ? 'POST /read with JSON body { "url": "..." }'
     : null;
+  const jdMethodIntro = method.allowGet
+    ? ["GET /jd/items/:skuId", "GET /jd/average?sku_id=..."]
+    : [];
+  const taobaoMethodIntro = method.allowGet
+    ? [
+        "GET /taobao/items/:itemId",
+        "GET /taobao/average?item_id=...",
+      ]
+    : [];
 
-  const endpoints = [getMethodIntro, postMethodIntro].filter(Boolean);
+  const endpoints = [
+    getMethodIntro,
+    postMethodIntro,
+    ...jdMethodIntro,
+    ...taobaoMethodIntro,
+  ].filter(Boolean);
 
   return c.text(`# viewview
 
@@ -700,6 +856,10 @@ ${endpoints.map((e) => `- ${e}`).join("\n")}
 
 ${method.allowGet ? "- GET /https://example.com" : ""}
 ${method.allowPost ? '- POST /read with body { "url": "https://example.com" }' : ""}
+${method.allowGet ? "- GET /jd/items/100342771276" : ""}
+${method.allowGet ? "- GET /jd/average?sku_id=100342771276&sku_id=..." : ""}
+${method.allowGet ? "- GET /taobao/items/1039489952733" : ""}
+${method.allowGet ? "- GET /taobao/average?item_id=1039489952733&item_id=..." : ""}
 
 ## Health Check:
 
@@ -712,6 +872,26 @@ ${method.allowPost ? '- POST /read with body { "url": "https://example.com" }' :
 app.get("/health", (c) => {
   return c.json({ status: "ok" });
 });
+
+// Bun hot reload keeps globalThis: stop the old worker before recovering its jobs.
+const runtime = globalThis as typeof globalThis & {
+  __viewviewDashboard?: { store: DashboardStore; queue: DashboardQueue };
+};
+const previousDashboard = runtime.__viewviewDashboard;
+if (previousDashboard) {
+  void previousDashboard.queue.stop().finally(() => previousDashboard.store.close());
+}
+const dashboardStore = new DashboardStore(
+  Bun.env.DATABASE_PATH || resolve(import.meta.dir, "../data/viewview.sqlite"),
+);
+const dashboardQueue = new DashboardQueue(dashboardStore, (job, signal) =>
+  job.platform === "jd"
+    ? readJdItem(job.item_id, { signal })
+    : readTaobaoItem(job.item_id, { signal }),
+);
+runtime.__viewviewDashboard = { store: dashboardStore, queue: dashboardQueue };
+app.route("/api", createDashboardAPI(dashboardStore, dashboardQueue, Bun.env.ACCESS_TOKEN));
+dashboardQueue.start();
 
 const SERVICE_QUERY_PARAMS = new Set([
   "navigate_timeout",
@@ -748,6 +928,196 @@ function getExplicitGetURL(c: any): string {
   if (!targetParams.size) return target;
   return `${target}${target.includes("?") ? "&" : "?"}${targetParams}`;
 }
+
+function getJdSkuIds(c: any): {
+  skuIds: string[];
+  invalid: string[];
+} {
+  const requestURL = new URL(c.req.url);
+  const rawValues = [
+    ...requestURL.searchParams.getAll("sku_id"),
+    ...requestURL.searchParams.getAll("sku_ids"),
+  ];
+  const candidates = rawValues.flatMap((value) => value.split(","));
+  const skuIds: string[] = [];
+  const invalid: string[] = [];
+
+  for (const candidate of candidates) {
+    const rawSkuId = candidate.trim();
+    if (!rawSkuId) continue;
+
+    const skuId = normalizeSkuId(rawSkuId);
+    if (!skuId) {
+      invalid.push(rawSkuId);
+    } else if (!skuIds.includes(skuId)) {
+      skuIds.push(skuId);
+    }
+  }
+
+  return { skuIds, invalid: [...new Set(invalid)] };
+}
+
+function getTaobaoItemIds(c: any): {
+  itemIds: string[];
+  invalid: string[];
+} {
+  const requestURL = new URL(c.req.url);
+  const rawValues = [
+    ...requestURL.searchParams.getAll("item_id"),
+    ...requestURL.searchParams.getAll("item_ids"),
+  ];
+  const candidates = rawValues.flatMap((value) => value.split(","));
+  const itemIds: string[] = [];
+  const invalid: string[] = [];
+
+  for (const candidate of candidates) {
+    const rawItemId = candidate.trim();
+    if (!rawItemId) continue;
+
+    const itemId = normalizeTaobaoItemId(rawItemId);
+    if (!itemId) {
+      invalid.push(rawItemId);
+    } else if (!itemIds.includes(itemId)) {
+      itemIds.push(itemId);
+    }
+  }
+
+  return { itemIds, invalid: [...new Set(invalid)] };
+}
+
+app.get("/jd/items/:skuId", async (c) => {
+  if (!method.allowGet) {
+    return c.json({ error: "Method Not Allowed" }, 405);
+  }
+
+  const rawSkuId = c.req.param("skuId");
+  const skuId = normalizeSkuId(rawSkuId);
+  if (!skuId) {
+    return c.json({ error: "skuId 必须是数字" }, 400);
+  }
+
+  try {
+    return c.json(await readJdItem(skuId, captureOptionsFromRequest(c)));
+  } catch (error) {
+    return errorResponse(c, error, "读取京东商品失败");
+  }
+});
+
+app.get("/jd/average", async (c) => {
+  if (!method.allowGet) {
+    return c.json({ error: "Method Not Allowed" }, 405);
+  }
+
+  const { skuIds, invalid } = getJdSkuIds(c);
+  if (invalid.length > 0) {
+    return c.json({ error: "sku_id 无效", invalid }, 400);
+  }
+  if (skuIds.length === 0) {
+    return c.json({ error: "至少需要一个 sku_id" }, 400);
+  }
+  if (skuIds.length > MAX_JD_BATCH_SIZE) {
+    return c.json(
+      { error: `一次最多查询 ${MAX_JD_BATCH_SIZE} 个 sku_id` },
+      400,
+    );
+  }
+
+  const items = await mapWithConcurrency(
+    skuIds,
+    JD_BATCH_CONCURRENCY,
+    async (skuId): Promise<JdItemResult> => {
+      try {
+        return await readJdItem(skuId, captureOptionsFromRequest(c));
+      } catch (error) {
+        return jdErrorResult(skuId, error);
+      }
+    },
+  );
+  const validPrices = items.flatMap((item) =>
+    item.actual_price === null ? [] : [item.actual_price],
+  );
+  const averageActualPrice = validPrices.length
+    ? Number(
+        (validPrices.reduce((sum, price) => sum + price, 0) / validPrices.length).toFixed(2),
+      )
+    : null;
+
+  return c.json({
+    sku_ids: skuIds,
+    total: items.length,
+    valid: validPrices.length,
+    failed: items.length - validPrices.length,
+    average_actual_price: averageActualPrice,
+    items,
+  });
+});
+
+app.get("/taobao/items/:itemId", async (c) => {
+  if (!method.allowGet) {
+    return c.json({ error: "Method Not Allowed" }, 405);
+  }
+
+  const rawItemId = c.req.param("itemId");
+  const itemId = normalizeTaobaoItemId(rawItemId);
+  if (!itemId) {
+    return c.json({ error: "itemId 必须是数字" }, 400);
+  }
+
+  try {
+    return c.json(await readTaobaoItem(itemId, captureOptionsFromRequest(c)));
+  } catch (error) {
+    return errorResponse(c, error, "读取淘宝商品失败");
+  }
+});
+
+app.get("/taobao/average", async (c) => {
+  if (!method.allowGet) {
+    return c.json({ error: "Method Not Allowed" }, 405);
+  }
+
+  const { itemIds, invalid } = getTaobaoItemIds(c);
+  if (invalid.length > 0) {
+    return c.json({ error: "item_id 无效", invalid }, 400);
+  }
+  if (itemIds.length === 0) {
+    return c.json({ error: "至少需要一个 item_id" }, 400);
+  }
+  if (itemIds.length > MAX_TAOBAO_BATCH_SIZE) {
+    return c.json(
+      { error: `一次最多查询 ${MAX_TAOBAO_BATCH_SIZE} 个 item_id` },
+      400,
+    );
+  }
+
+  const items = await mapWithConcurrency(
+    itemIds,
+    TAOBAO_BATCH_CONCURRENCY,
+    async (itemId): Promise<TaobaoItemResult> => {
+      try {
+        return await readTaobaoItem(itemId, captureOptionsFromRequest(c));
+      } catch (error) {
+        return taobaoErrorResult(itemId, error);
+      }
+    },
+  );
+  const validPrices = items.flatMap((item) =>
+    item.actual_price === null ? [] : [item.actual_price],
+  );
+  const averageActualPrice = validPrices.length
+    ? Number(
+        (validPrices.reduce((sum, price) => sum + price, 0) / validPrices.length).toFixed(2),
+      )
+    : null;
+
+  return c.json({
+    item_ids: itemIds,
+    total: items.length,
+    valid: validPrices.length,
+    failed: items.length - validPrices.length,
+    average_actual_price: averageActualPrice,
+    items,
+  });
+});
 
 app.get("/read", async (c) => {
   if (!method.allowGet) {

@@ -1,5 +1,12 @@
 # deps
 node_modules/
+webui/dist/
+
+# local price database (including SQLite WAL files)
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
 
 # env
 .env

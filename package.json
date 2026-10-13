@@ -1,7 +1,13 @@
 {
   "name": "viewview",
   "scripts": {
-    "dev": "bun run --hot src/index.ts"
+    "dev": "bun run scripts/dev.ts",
+    "dev:api": "bun run --hot src/index.ts",
+    "dev:webui": "bun --cwd webui run dev",
+    "check": "bunx tsc --noEmit",
+    "test": "bun test src/dashboard webui/tests",
+    "check:webui": "bun --cwd webui run check",
+    "build:webui": "bun --cwd webui run build"
   },
   "dependencies": {
     "@mizchi/readability": "^0.7.7",

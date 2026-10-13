@@ -1,0 +1,13 @@
+/* Spectrum v3's zh-CN styles use this family before falling back to SimSun.
+   Font mapping: https://github.com/adobe/react-spectrum/discussions/2385 */
+@font-face {
+  font-family: "adobe-clean-han-simplified-c";
+  src: local("Microsoft YaHei"), local("PingFang SC"),
+    local("Noto Sans CJK SC"), local("Noto Sans SC"),
+    local("WenQuanYi Micro Hei");
+}
+
+.theme {
+  --spectrum-global-font-family-base: sans-serif;
+  font-family: var(--spectrum-global-font-family-base);
+}
