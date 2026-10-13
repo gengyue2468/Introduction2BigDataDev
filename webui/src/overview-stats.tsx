@@ -1,19 +1,21 @@
 import { Divider, Flex, Grid, Heading, LabeledValue } from "@adobe/react-spectrum";
-import { platformLabel, type Job, type Platform, type Product } from "./api";
+import { platformLabel, type Job, type Platform, type Product, type ProductGroup } from "./api";
 
 const platforms: Platform[] = ["taobao", "jd"];
 
-export function OverviewStats({ products, jobs }: { products: Product[]; jobs: Job[] }) {
+export function OverviewStats({ products, jobs, groups }: { products: Product[]; jobs: Job[]; groups: ProductGroup[] }) {
   return (
     <Flex direction="column" gap="size-300">
       <Heading level={2} margin="size-0">统计概览</Heading>
       <Grid columns={["1fr", "1fr"]} gap="size-300">
-        <LabeledValue label="商品总数" value={products.length} />
+        <LabeledValue label="SKU / 商品链接总数" value={products.length} />
         <LabeledValue label="有价格的商品" value={products.filter((product) => product.actual_price !== null).length} />
         <LabeledValue label="排队中" value={jobs.filter((job) => job.status === "queued").length} />
         <LabeledValue label="正在采集" value={jobs.filter((job) => job.status === "running").length} />
         <LabeledValue label="采集失败的商品" value={products.filter((product) => product.job_status === "failed").length} />
         <LabeledValue label="未采集的商品" value={products.filter((product) => product.job_status === null && product.actual_price === null).length} />
+        <LabeledValue label="同款商品组" value={groups.length} />
+        <LabeledValue label="未归组 SKU / 链接" value={products.filter((product) => product.group_id === null).length} />
       </Grid>
       {platforms.map((platform) => {
         const items = products.filter((product) => product.platform === platform);

@@ -1,5 +1,5 @@
 import { Hono, type Context } from "hono";
-import { DashboardError, DashboardStore, type Platform } from "./store";
+import { DashboardError, DashboardStore, type Platform, type TimeRange, type TimeRangeInput } from "./store";
 import { DashboardQueue } from "./queue";
 
 async function readBody(c: Context): Promise<Record<string, unknown>> {
@@ -24,6 +24,32 @@ function positiveId(value: unknown) {
 function text(value: unknown, label: string, max: number) {
   if (typeof value !== "string" || value.length > max) throw new DashboardError(`${label}无效（最多 ${max} 字）`);
   return value.trim();
+}
+
+function requiredText(value: unknown, label: string, max: number) {
+  const result = text(value, label, max);
+  if (!result) throw new DashboardError(`${label}不能为空`);
+  return result;
+}
+
+const allowedTimeRanges = new Set<TimeRange>(["6h", "1d", "3d", "7d", "15d"]);
+
+function timeRange(c: Context): TimeRangeInput {
+  const requested = c.req.query("range");
+  if (requested !== undefined) {
+    if (!allowedTimeRanges.has(requested as TimeRange)) {
+      throw new DashboardError("时间范围只能是 6h、1d、3d、7d 或 15d");
+    }
+    return requested as TimeRange;
+  }
+
+  // Keep the old days query working for existing clients, while the UI uses
+  // the smaller fixed range set above.
+  const legacyDays = Number(c.req.query("days") ?? 7);
+  if (!Number.isInteger(legacyDays) || legacyDays < 1 || legacyDays > 365) {
+    throw new DashboardError("时间范围只能是 6 小时、1 天、3 天、7 天或 15 天");
+  }
+  return legacyDays;
 }
 
 export function createDashboardAPI(store: DashboardStore, queue: DashboardQueue, accessToken = "") {
@@ -83,6 +109,54 @@ export function createDashboardAPI(store: DashboardStore, queue: DashboardQueue,
     return c.json({ deleted: true });
   });
 
+  api.get("/groups", (c) => c.json({ groups: store.listGroups() }));
+  api.post("/groups", async (c) => {
+    const body = await readBody(c);
+    return c.json(store.createGroup(
+      requiredText(body.name, "同款名称", 250),
+      requiredText(body.specification, "型号和规格", 500),
+      body.notes === undefined ? "" : text(body.notes, "备注", 1000),
+    ), 201);
+  });
+  api.patch("/groups/:id", async (c) => {
+    const body = await readBody(c);
+    const keys = Object.keys(body);
+    if (!keys.length || keys.some((key) => !["name", "specification", "notes"].includes(key))) {
+      throw new DashboardError("只能编辑同款名称、规格和备注");
+    }
+    return c.json(store.updateGroup(positiveId(c.req.param("id")), {
+      name: body.name === undefined ? undefined : requiredText(body.name, "同款名称", 250),
+      specification: body.specification === undefined ? undefined : requiredText(body.specification, "型号和规格", 500),
+      notes: body.notes === undefined ? undefined : text(body.notes, "备注", 1000),
+    }));
+  });
+  api.delete("/groups/:id", (c) => {
+    store.deleteGroup(positiveId(c.req.param("id")));
+    return c.json({ deleted: true });
+  });
+  api.post("/groups/:id/members", async (c) => {
+    const body = await readBody(c);
+    if (body.confirmed_same_model !== true) throw new DashboardError("请先确认所选 SKU 型号和规格一致");
+    if (!Array.isArray(body.product_ids) || !body.product_ids.length || body.product_ids.length > 1000) {
+      throw new DashboardError("一次可关联 1 到 1000 个 SKU");
+    }
+    return c.json(store.addGroupMembers(positiveId(c.req.param("id")), body.product_ids.map(positiveId)));
+  });
+  api.delete("/groups/:id/members/:productId", (c) => {
+    store.removeGroupMember(positiveId(c.req.param("id")), positiveId(c.req.param("productId")));
+    return c.json({ deleted: true });
+  });
+  api.post("/groups/:id/jobs", (c) => {
+    const members = store.groupMembers(positiveId(c.req.param("id")));
+    if (!members.length) throw new DashboardError("请先关联 SKU");
+    const result = store.enqueue(members.map((member) => member.id));
+    queue.wake();
+    return c.json(result, 202);
+  });
+  api.get("/groups/:id/comparison", (c) => {
+    return c.json(store.groupComparison(positiveId(c.req.param("id")), timeRange(c)));
+  });
+
   api.get("/jobs", (c) => c.json({ jobs: store.listJobs() }));
   api.post("/jobs", async (c) => {
     const body = await readBody(c);
@@ -95,20 +169,17 @@ export function createDashboardAPI(store: DashboardStore, queue: DashboardQueue,
   });
 
   api.get("/products/:id/history", (c) => {
-    const days = Number(c.req.query("days") ?? 30);
-    if (!Number.isInteger(days) || days < 1 || days > 365) throw new DashboardError("天数必须为 1 到 365");
-    return c.json(store.history(positiveId(c.req.param("id")), days));
+    return c.json(store.history(positiveId(c.req.param("id")), timeRange(c)));
   });
   api.get("/history/average", (c) => {
-    const days = Number(c.req.query("days") ?? 30);
-    if (!Number.isInteger(days) || days < 1 || days > 365) throw new DashboardError("天数必须为 1 到 365");
+    const range = timeRange(c);
     const platform = c.req.query("platform");
     if (platform !== undefined && platform !== "jd" && platform !== "taobao") {
       throw new DashboardError("平台必须是 jd 或 taobao");
     }
     const ids = c.req.queries("product_id");
     if (ids && ids.length > 1000) throw new DashboardError("一次最多统计 1000 个商品");
-    return c.json(store.averageHistory(days, platform, ids?.map(positiveId)));
+    return c.json(store.averageHistory(range, platform, ids?.map(positiveId)));
   });
   api.post("/products/:id/observations", async (c) => {
     const body = await readBody(c);

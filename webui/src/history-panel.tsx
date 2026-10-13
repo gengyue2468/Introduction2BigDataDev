@@ -3,7 +3,7 @@ import {
   ProgressCircle, Row, TableBody, TableHeader, TableView, Text, TextField,
 } from "@adobe/react-spectrum";
 import { lazy, Suspense, useEffect, useState, type FormEvent } from "react";
-import { addObservation, fetchHistory, type Observation, type PriceHistory, type Product } from "./api";
+import { addObservation, fetchHistory, timeRangeOptions, type Observation, type PriceHistory, type Product, type TimeRange } from "./api";
 import type { RunMutation } from "./dashboard";
 
 const PriceChart = lazy(() => import("./price-chart"));
@@ -22,7 +22,7 @@ export function HistoryPanel({ product, busy, revision, runMutation, onDelete }:
   runMutation: RunMutation;
   onDelete: (observation: Observation) => void;
 }) {
-  const [days, setDays] = useState(30);
+  const [range, setRange] = useState<TimeRange>("7d");
   const [history, setHistory] = useState<PriceHistory | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -35,7 +35,7 @@ export function HistoryPanel({ product, busy, revision, runMutation, onDelete }:
     const controller = new AbortController();
     setLoading(true);
     setError("");
-    fetchHistory(product.id, days, controller.signal).then((result) => {
+    fetchHistory(product.id, range, controller.signal).then((result) => {
       if (!controller.signal.aborted) setHistory(result);
     }).catch((error) => {
       if (!controller.signal.aborted) setError(error instanceof Error ? error.message : "历史加载失败");
@@ -43,10 +43,10 @@ export function HistoryPanel({ product, busy, revision, runMutation, onDelete }:
       if (!controller.signal.aborted) setLoading(false);
     });
     return () => controller.abort();
-  }, [product.id, product.observed_at, product.actual_price, days, revision]);
+  }, [product.id, product.observed_at, product.actual_price, range, revision]);
 
   // Never display the previously selected product's chart during a new request.
-  const currentHistory = history?.product_id === product.id && history.days === days ? history : null;
+  const currentHistory = history?.product_id === product.id && history.range === range ? history : null;
 
   const saveObservation = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -66,11 +66,8 @@ export function HistoryPanel({ product, busy, revision, runMutation, onDelete }:
   return (
     <Flex direction="column" gap="size-200">
       <Flex gap="size-100" alignItems="end" justifyContent="space-between" wrap>
-        <Picker label="日期范围" selectedKey={String(days)} onSelectionChange={(key) => setDays(Number(key))} width="size-1600">
-          <Item key="7">最近 7 天</Item>
-          <Item key="30">最近 30 天</Item>
-          <Item key="90">最近 90 天</Item>
-          <Item key="365">最近 365 天</Item>
+        <Picker label="时间范围" selectedKey={range} onSelectionChange={(key) => setRange(String(key) as TimeRange)} width="size-1600">
+          {timeRangeOptions.map((option) => <Item key={option.key}>{option.label}</Item>)}
         </Picker>
         <ActionButton onPress={() => setShowForm((value) => !value)} isDisabled={busy}>
           {showForm ? "取消新增" : "新增价格记录"}

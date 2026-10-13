@@ -8,12 +8,13 @@ import {
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   ApiError, createProducts, deleteObservation, deleteProduct, enqueueProducts,
-  fetchJobs, fetchProducts, platformLabel, productLabel, updateProduct,
-  type Job, type JobStatus, type Platform, type Product,
+  fetchGroups, fetchJobs, fetchProducts, platformLabel, productLabel, updateProduct,
+  type Job, type JobStatus, type Platform, type Product, type ProductGroup,
 } from "./api";
 import { AveragePanel } from "./average-panel";
 import { DashboardColumns } from "./dashboard-columns";
 import { HistoryPanel } from "./history-panel";
+import { GroupPanel } from "./group-panel";
 import { OverviewStats } from "./overview-stats";
 import { AVERAGE_KEY, chartKeyForSelection, normalizeSelection } from "./selection";
 
@@ -27,13 +28,14 @@ export function formatPrice(price: number | null) {
 
 export type RunMutation = (operation: () => Promise<unknown>, message: string) => Promise<boolean>;
 type DeleteTarget = { kind: "product" | "observation"; id: number; label: string };
-type DashboardTab = "overview" | Platform;
+type DashboardTab = "overview" | "comparison" | Platform;
 
 export function Dashboard() {
   const refreshId = useRef(0);
   const mutationLock = useRef(false);
   const [products, setProducts] = useState<Product[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [groups, setGroups] = useState<ProductGroup[]>([]);
   const [initialLoading, setInitialLoading] = useState(true);
   const [loadError, setLoadError] = useState<Error | null>(null);
   const [mutationError, setMutationError] = useState("");
@@ -53,10 +55,11 @@ export function Dashboard() {
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
     const requestId = ++refreshId.current;
-    const [productResult, jobResult] = await Promise.all([fetchProducts(signal), fetchJobs(signal)]);
+    const [productResult, jobResult, groupResult] = await Promise.all([fetchProducts(signal), fetchJobs(signal), fetchGroups(signal)]);
     if (signal?.aborted || requestId !== refreshId.current) return;
     setProducts(productResult.products);
     setJobs(jobResult.jobs);
+    setGroups(groupResult.groups);
     setLoadError(null);
   }, []);
 
@@ -109,7 +112,7 @@ export function Dashboard() {
   };
 
   const changeTab = (key: Key) => {
-    if (key !== "overview" && key !== "jd" && key !== "taobao") return;
+    if (key !== "overview" && key !== "comparison" && key !== "jd" && key !== "taobao") return;
     setTab(key);
     setSelected(new Set());
     setChartKey(AVERAGE_KEY);
@@ -123,7 +126,8 @@ export function Dashboard() {
     setChartKey(key);
   };
 
-  const platformProducts = products.filter((product) => product.platform === tab);
+  const platform = tab === "jd" || tab === "taobao" ? tab : null;
+  const platformProducts = products.filter((product) => product.platform === platform);
   const needle = search.trim().toLocaleLowerCase();
   const filtered = platformProducts.filter((product) =>
     [product.item_id, productLabel(product), product.shop_name, product.notes]
@@ -139,7 +143,7 @@ export function Dashboard() {
   ];
   const activeJobs = jobs.filter((job) => job.platform === tab && (job.status === "queued" || job.status === "running"));
   const recentFailures = platformProducts.filter((product) => product.job_status === "failed").slice(0, 5);
-  const dataVersion = `${revision}:${products.map((product) => `${product.id}:${product.updated_at}:${product.observed_at}:${product.actual_price}`).join("|")}`;
+  const dataVersion = `${revision}:${products.map((product) => `${product.id}:${product.group_id}:${product.updated_at}:${product.observed_at}:${product.actual_price}`).join("|")}:${groups.map((group) => `${group.id}:${group.member_count}:${group.updated_at}`).join("|")}`;
 
   const changeSelection = (keys: Selection) => {
     const next = normalizeSelection(keys, filtered.map((product) => product.id));
@@ -149,7 +153,7 @@ export function Dashboard() {
 
   const saveProduct = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (busy || tab === "overview") return;
+    if (busy || (tab !== "jd" && tab !== "taobao")) return;
     if (editingId !== null) {
       if (await runMutation(() => updateProduct(editingId, { name, notes }), "已保存修改")) resetForm();
       return;
@@ -218,9 +222,9 @@ export function Dashboard() {
     );
   }
 
-  const platformSidebar = tab === "overview" ? null : (
+  const platformSidebar = platform === null ? null : (
     <Flex direction="column" gap="size-300" width="100%">
-      <Form aria-label={editingId === null ? `新增${platformLabel(tab)}商品` : "编辑商品"} width="100%" onSubmit={saveProduct}>
+      <Form aria-label={editingId === null ? `新增${platformLabel(platform)}商品` : "编辑商品"} width="100%" onSubmit={saveProduct}>
         <TextArea label={editingId === null ? "商品 ID（可换行批量输入）" : "商品 ID"}
           value={itemIds} onChange={setItemIds} isReadOnly={editingId !== null} isDisabled={busy}
           placeholder={tab === "jd" ? "100342771276" : "1039489952733"} isRequired />
@@ -239,7 +243,7 @@ export function Dashboard() {
         setSelected(new Set());
         setChartKey(AVERAGE_KEY);
       }} />
-      <TableView aria-label={`${platformLabel(tab)}商品列表`} selectionMode="multiple" density="compact" overflowMode="wrap"
+      <TableView aria-label={`${platformLabel(platform)}商品列表`} selectionMode="multiple" density="compact" overflowMode="wrap"
         height="size-3600" width="100%" selectedKeys={visibleSelected} onSelectionChange={changeSelection}
         disabledKeys={busy ? filtered.map((product) => String(product.id)) : []}
         onAction={(key) => focusProduct(String(key))}>
@@ -255,6 +259,7 @@ export function Dashboard() {
                 <Flex direction="column" gap="size-50">
                   <Text>{productLabel(product)}</Text>
                   <Text>{product.job_status ? jobLabels[product.job_status] : "未采集"}</Text>
+                  {product.group_name ? <Text>同款组：{product.group_name}</Text> : null}
                 </Flex>
               </Cell>
               <Cell>{formatPrice(product.actual_price)}</Cell>
@@ -301,7 +306,7 @@ export function Dashboard() {
     </Flex>
   );
 
-  const platformPanel = tab === "overview" ? null : (
+  const platformPanel = platform === null ? null : (
     <DashboardColumns
       left={platformSidebar}
       right={
@@ -316,7 +321,7 @@ export function Dashboard() {
             <HistoryPanel key={historyProduct.id} product={historyProduct} busy={busy} revision={revision} runMutation={runMutation}
               onDelete={(observation) => setDeleteTarget({ kind: "observation", id: observation.id, label: `${formatPrice(observation.actual_price)} 的价格记录` })} />
           ) : (
-            <AveragePanel platform={tab} productIds={selectedIds.length ? selectedIds : undefined} dataVersion={dataVersion} />
+            <AveragePanel platform={platform} productIds={selectedIds.length ? selectedIds : undefined} dataVersion={dataVersion} />
           )}
         </Flex>
       }
@@ -333,16 +338,21 @@ export function Dashboard() {
           <Item key="overview">总览</Item>
           <Item key="taobao">淘宝</Item>
           <Item key="jd">京东</Item>
+          <Item key="comparison">同款比价</Item>
         </TabList>
         <TabPanels marginTop="size-200">
           <Item key="overview">
             <DashboardColumns
-              left={initialLoading ? <ProgressCircle aria-label="加载统计" isIndeterminate size="S" /> : <OverviewStats products={products} jobs={jobs} />}
+              left={initialLoading ? <ProgressCircle aria-label="加载统计" isIndeterminate size="S" /> : <OverviewStats products={products} jobs={jobs} groups={groups} />}
               right={<AveragePanel dataVersion={dataVersion} />}
             />
           </Item>
           <Item key="taobao">{tab === "taobao" ? platformPanel : null}</Item>
           <Item key="jd">{tab === "jd" ? platformPanel : null}</Item>
+          <Item key="comparison">
+            <GroupPanel groups={groups} products={products} busy={busy} dataVersion={dataVersion} runMutation={runMutation}
+              onViewProduct={(product) => { changeTab(product.platform); focusProduct(String(product.id)); }} />
+          </Item>
         </TabPanels>
       </Tabs>
       <DialogContainer onDismiss={() => setDeleteTarget(null)}>

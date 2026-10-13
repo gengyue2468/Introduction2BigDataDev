@@ -1146,10 +1146,22 @@ app.post("/read", authMiddleware, async (c) => {
   return readPage(c, req.url);
 });
 
-Bun.serve({
+const server = Bun.serve({
   fetch: app.fetch,
   port: 9233,
   // Challenge completion may legitimately take up to five minutes. All
   // application-level operations have their own bounded timeouts.
   idleTimeout: 0,
 });
+
+// Start the isolated, visible browser as soon as the API is ready. The
+// launcher opens about:blank, so JD/Taobao can be logged in before the first
+// queued crawl instead of making the first request pay the browser startup
+// cost. A manually started CDP browser is still accepted unchanged.
+void getBrowserDebuggingURL().then(() => {
+  console.info(`[browser] ready for login on CDP port ${Bun.env.BROWSER_CDP_PORT || "9222"}; keep the blank page open`);
+}).catch((error) => {
+  console.warn(`[browser] startup skipped: ${error instanceof Error ? error.message : String(error)}`);
+});
+
+console.info(`[viewview] API listening on ${server.hostname}:${server.port}`);

@@ -4,6 +4,12 @@ import { dirname } from "node:path";
 
 export type Platform = "jd" | "taobao";
 export type JobStatus = "queued" | "running" | "succeeded" | "failed";
+export type TimeRange = "6h" | "1d" | "3d" | "7d" | "15d";
+export type TimeRangeInput = TimeRange | number;
+
+const BEIJING_OFFSET_MS = 8 * 3_600_000;
+const HOUR_MS = 3_600_000;
+const DAY_MS = 86_400_000;
 
 export class DashboardError extends Error {
   constructor(message: string, readonly status = 400) {
@@ -19,6 +25,9 @@ interface ProductRow {
   item_name: string;
   shop_name: string;
   notes: string;
+  group_id: number | null;
+  group_name: string | null;
+  group_specification: string | null;
   created_at: string;
   updated_at: string;
   actual_price_cents: number | null;
@@ -31,6 +40,16 @@ interface ProductRow {
 export interface Product extends Omit<ProductRow, "actual_price_cents" | "daily_price_cents"> {
   actual_price: number | null;
   daily_price: number | null;
+}
+
+export interface ProductGroup {
+  id: number;
+  name: string;
+  specification: string;
+  notes: string;
+  created_at: string;
+  updated_at: string;
+  member_count: number;
 }
 
 export interface Job {
@@ -103,23 +122,64 @@ function observationFromRow(row: ObservationRow): Observation {
   };
 }
 
-function historyRange(days: number, now: Date) {
-  const beijingToday = new Date(now.getTime() + 8 * 3_600_000).toISOString().slice(0, 10);
-  const today = Date.parse(`${beijingToday}T00:00:00Z`);
+function beijingBucket(value: string, bucket: "hour" | "day") {
+  const local = new Date(Date.parse(value) + BEIJING_OFFSET_MS).toISOString();
+  return bucket === "hour"
+    ? `${local.slice(0, 13).replace("T", " ")}:00`
+    : local.slice(0, 10);
+}
+
+function formatBeijingHour(localEpochMs: number) {
+  return `${new Date(localEpochMs).toISOString().slice(0, 13).replace("T", " ")}:00`;
+}
+
+function historyRange(input: TimeRangeInput, now: Date) {
+  const beijingNow = now.getTime() + BEIJING_OFFSET_MS;
+  if (input === "6h") {
+    const currentHour = Math.floor(beijingNow / HOUR_MS) * HOUR_MS;
+    const dates = Array.from({ length: 6 }, (_, index) =>
+      formatBeijingHour(currentHour - (5 - index) * HOUR_MS),
+    );
+    return {
+      range: "6h",
+      days: 0,
+      hours: 6,
+      bucket: "hour" as const,
+      bucketExpression: "strftime('%Y-%m-%d %H:00', o.observed_at, '+8 hours')",
+      dates,
+      start: new Date(currentHour - 5 * HOUR_MS - BEIJING_OFFSET_MS).toISOString(),
+      end: now.toISOString(),
+    };
+  }
+
+  const days = typeof input === "number" ? input : Number(input.slice(0, -1));
+  if (!Number.isInteger(days) || days < 1 || days > 365) {
+    throw new DashboardError("时间范围必须是 6 小时、1 天、3 天、7 天或 15 天");
+  }
+  const beijingToday = new Date(beijingNow).toISOString().slice(0, 10);
+  const today = Math.floor(beijingNow / DAY_MS) * DAY_MS;
   const dates = Array.from({ length: days }, (_, index) =>
-    new Date(today - (days - 1 - index) * 86_400_000).toISOString().slice(0, 10),
+    new Date(today - (days - 1 - index) * DAY_MS).toISOString().slice(0, 10),
   );
   return {
+    range: typeof input === "number" ? `${days}d` : input,
+    days,
+    hours: days * 24,
+    bucket: "day" as const,
+    bucketExpression: "date(o.observed_at, '+8 hours')",
     dates,
-    start: new Date(Date.parse(`${dates[0]}T00:00:00+08:00`)).toISOString(),
-    end: new Date(Date.parse(`${beijingToday}T00:00:00+08:00`) + 86_400_000).toISOString(),
+    start: new Date(today - (days - 1) * DAY_MS - BEIJING_OFFSET_MS).toISOString(),
+    end: new Date(today + DAY_MS - BEIJING_OFFSET_MS).toISOString(),
   };
 }
 
 const productSelect = `
   SELECT p.*, o.actual_price_cents, o.daily_price_cents, o.observed_at,
-         j.status AS job_status, j.error AS job_error
+         j.status AS job_status, j.error AS job_error,
+         gm.group_id, g.name AS group_name, g.specification AS group_specification
   FROM products p
+  LEFT JOIN group_members gm ON gm.product_id = p.id
+  LEFT JOIN product_groups g ON g.id = gm.group_id
   LEFT JOIN price_observations o ON o.id = (
     SELECT id FROM price_observations WHERE product_id = p.id
     ORDER BY observed_at DESC, id DESC LIMIT 1
@@ -137,6 +197,10 @@ const jobSelect = `
 const observationSelect = `
   SELECT id, product_id, actual_price_cents, daily_price_cents,
          observed_at, source, source_url FROM price_observations`;
+
+const groupSelect = `
+  SELECT g.*, (SELECT COUNT(*) FROM group_members WHERE group_id = g.id) AS member_count
+  FROM product_groups g`;
 
 export class DashboardStore {
   readonly db: Database;
@@ -186,6 +250,20 @@ export class DashboardStore {
       );
       CREATE INDEX IF NOT EXISTS observations_product_time
         ON price_observations(product_id, observed_at, id);
+      CREATE TABLE IF NOT EXISTS product_groups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        specification TEXT NOT NULL,
+        notes TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(name, specification)
+      );
+      CREATE TABLE IF NOT EXISTS group_members (
+        group_id INTEGER NOT NULL REFERENCES product_groups(id) ON DELETE CASCADE,
+        product_id INTEGER NOT NULL UNIQUE REFERENCES products(id) ON DELETE CASCADE,
+        PRIMARY KEY(group_id, product_id)
+      );
     `);
   }
 
@@ -242,6 +320,146 @@ export class DashboardStore {
   deleteProduct(id: number) {
     this.requireProduct(id);
     this.db.query("DELETE FROM products WHERE id = ?").run(id);
+  }
+
+  listGroups() {
+    return this.db.query<ProductGroup, []>(`${groupSelect} ORDER BY g.id DESC`).all();
+  }
+
+  requireGroup(id: number) {
+    const group = this.db.query<ProductGroup, [number]>(`${groupSelect} WHERE g.id = ?`).get(id);
+    if (!group) throw new DashboardError("同款商品组不存在", 404);
+    return group;
+  }
+
+  createGroup(name: string, specification: string, notes = "") {
+    if (this.db.query("SELECT id FROM product_groups WHERE name = ? AND specification = ?").get(name, specification)) {
+      throw new DashboardError("该名称和规格的商品组已存在", 409);
+    }
+    const timestamp = new Date().toISOString();
+    const result = this.db.query(`INSERT INTO product_groups
+      (name, specification, notes, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`)
+      .run(name, specification, notes, timestamp, timestamp);
+    return this.requireGroup(Number(result.lastInsertRowid));
+  }
+
+  updateGroup(id: number, changes: { name?: string; specification?: string; notes?: string }) {
+    const group = this.requireGroup(id);
+    const name = changes.name ?? group.name;
+    const specification = changes.specification ?? group.specification;
+    if (group.member_count && specification !== group.specification) {
+      throw new DashboardError("请先移出已关联 SKU，再修改商品组规格", 409);
+    }
+    if (this.db.query("SELECT id FROM product_groups WHERE name = ? AND specification = ? AND id <> ?")
+      .get(name, specification, id)) throw new DashboardError("该名称和规格的商品组已存在", 409);
+    this.db.query("UPDATE product_groups SET name = ?, specification = ?, notes = ?, updated_at = ? WHERE id = ?")
+      .run(name, specification, changes.notes ?? group.notes, new Date().toISOString(), id);
+    return this.requireGroup(id);
+  }
+
+  deleteGroup(id: number) {
+    this.requireGroup(id);
+    // Cascades only the membership links; listings, observations and jobs remain.
+    this.db.query("DELETE FROM product_groups WHERE id = ?").run(id);
+  }
+
+  groupMembers(id: number) {
+    this.requireGroup(id);
+    return this.db.query<ProductRow, [number]>(`${productSelect}
+      WHERE gm.group_id = ? ORDER BY p.platform, p.id`).all(id).map(productFromRow);
+  }
+
+  addGroupMembers(groupId: number, productIds: number[]) {
+    return this.db.transaction(() => {
+      this.requireGroup(groupId);
+      const ids = [...new Set(productIds)];
+      for (const id of ids) {
+        const product = this.requireProduct(id);
+        if (product.group_id !== null && product.group_id !== groupId) {
+          throw new DashboardError(`商品 ${product.item_id} 已属于「${product.group_name}」，请先从原组移出`, 409);
+        }
+      }
+      let created = 0;
+      for (const id of ids) created += this.db.query(
+        "INSERT OR IGNORE INTO group_members (group_id, product_id) VALUES (?, ?)",
+      ).run(groupId, id).changes;
+      this.db.query("UPDATE product_groups SET updated_at = ? WHERE id = ?").run(new Date().toISOString(), groupId);
+      return { created, existing: ids.length - created, group: this.requireGroup(groupId) };
+    })();
+  }
+
+  removeGroupMember(groupId: number, productId: number) {
+    this.requireGroup(groupId);
+    if (!this.db.query("DELETE FROM group_members WHERE group_id = ? AND product_id = ?").run(groupId, productId).changes) {
+      throw new DashboardError("该 SKU 不在此商品组中", 404);
+    }
+    this.db.query("UPDATE product_groups SET updated_at = ? WHERE id = ?").run(new Date().toISOString(), groupId);
+  }
+
+  groupComparison(groupId: number, rangeInput: TimeRangeInput, now = new Date()) {
+    const group = this.requireGroup(groupId);
+    const members = this.groupMembers(groupId);
+    const today = new Date(now.getTime() + 8 * 3_600_000).toISOString().slice(0, 10);
+    const quoted = members.filter((member) => member.actual_price !== null && member.observed_at !== null);
+    const dayOf = (value: string) => new Date(Date.parse(value) + 8 * 3_600_000).toISOString().slice(0, 10);
+    const quoteDates = quoted.map((member) => dayOf(member.observed_at!)).filter((date) => date <= today).sort();
+    const comparisonDate = quoteDates[quoteDates.length - 1] ?? null;
+    const current = quoted.filter((member) => dayOf(member.observed_at!) === comparisonDate);
+    const prices = current.map((member) => priceToCents(member.actual_price!));
+    const minimum = prices.length ? Math.min(...prices) / 100 : null;
+    const range = historyRange(rangeInput, now);
+    const { start, end } = range;
+    const rows = this.db.query<{
+      product_id: number; bucket: string; actual_price_cents: number;
+    }, [number, string, string]>(`
+      WITH ranked AS (
+        SELECT o.product_id, ${range.bucketExpression} AS bucket, o.actual_price_cents,
+          ROW_NUMBER() OVER (
+            PARTITION BY o.product_id, ${range.bucketExpression}
+            ORDER BY o.observed_at DESC, o.id DESC
+          ) AS sample_rank
+        FROM price_observations o JOIN group_members gm ON gm.product_id = o.product_id
+        WHERE gm.group_id = ? AND o.observed_at >= ? AND o.observed_at < ?
+      )
+      SELECT product_id, bucket, actual_price_cents FROM ranked WHERE sample_rank = 1
+    `).all(groupId, start, end);
+    const byProduct = new Map(rows.map((row) => [`${row.product_id}:${row.bucket}`, row.actual_price_cents]));
+    const dayTotals = new Map<string, { sum: number; count: number }>();
+    for (const row of rows) {
+      const total = dayTotals.get(row.bucket) ?? { sum: 0, count: 0 };
+      total.sum += row.actual_price_cents;
+      total.count++;
+      dayTotals.set(row.bucket, total);
+    }
+    return {
+      group,
+      comparison_date: comparisonDate,
+      valid_count: current.length,
+      average_actual_price: prices.length ? Math.round(prices.reduce((sum, price) => sum + price, 0) / prices.length) / 100 : null,
+      lowest_price: minimum,
+      highest_price: prices.length ? Math.max(...prices) / 100 : null,
+      cheapest_product_ids: current.filter((member) => member.actual_price === minimum).map((member) => member.id),
+      members: members.map((member) => ({
+        ...member,
+        comparison_status: member.actual_price === null || member.observed_at === null
+          ? "missing" as const : dayOf(member.observed_at) === comparisonDate ? "current" as const : "stale" as const,
+      })),
+      range: range.range,
+      days: range.days,
+      hours: range.hours,
+      points: range.dates.map((date) => {
+        const total = dayTotals.get(date);
+        return { date, actual_price: total ? Math.round(total.sum / total.count) / 100 : null, sample_count: total?.count ?? 0 };
+      }),
+      series: members.map((member) => ({
+        product_id: member.id,
+        platform: member.platform,
+        item_id: member.item_id,
+        shop_name: member.shop_name,
+        name: member.name || member.item_name || member.item_id,
+        points: range.dates.map((date) => ({ date, actual_price: fromCents(byProduct.get(`${member.id}:${date}`) ?? null) })),
+      })),
+    };
   }
 
   enqueue(productIds: number[]) {
@@ -342,33 +560,35 @@ export class DashboardStore {
     }
   }
 
-  history(productId: number, days: number, now = new Date()) {
+  history(productId: number, rangeInput: TimeRangeInput, now = new Date()) {
     this.requireProduct(productId);
-    const { dates, start, end } = historyRange(days, now);
+    const range = historyRange(rangeInput, now);
     const observations = this.db.query<ObservationRow, [number, string, string]>(
       `${observationSelect} WHERE product_id = ? AND observed_at >= ? AND observed_at < ?
        ORDER BY observed_at, id`,
-    ).all(productId, start, end).map(observationFromRow);
-    const lastByDay = new Map<string, Observation>();
+    ).all(productId, range.start, range.end).map(observationFromRow);
+    const lastByBucket = new Map<string, Observation>();
     for (const observation of observations) {
-      const day = new Date(Date.parse(observation.observed_at) + 8 * 3_600_000).toISOString().slice(0, 10);
-      lastByDay.set(day, observation);
+      lastByBucket.set(beijingBucket(observation.observed_at, range.bucket), observation);
     }
     return {
       product_id: productId,
-      days,
-      points: dates.map((date) => ({
+      range: range.range,
+      days: range.days,
+      hours: range.hours,
+      points: range.dates.map((date) => ({
         date,
-        actual_price: lastByDay.get(date)?.actual_price ?? null,
-        daily_price: lastByDay.get(date)?.daily_price ?? null,
+        actual_price: lastByBucket.get(date)?.actual_price ?? null,
+        daily_price: lastByBucket.get(date)?.daily_price ?? null,
       })),
       observations: observations.slice(-100).reverse(),
       total_observations: observations.length,
     };
   }
 
-  averageHistory(days: number, platform?: Platform, productIds?: number[], now = new Date()) {
-    const { dates, start, end } = historyRange(days, now);
+  averageHistory(rangeInput: TimeRangeInput, platform?: Platform, productIds?: number[], now = new Date()) {
+    const range = historyRange(rangeInput, now);
+    const { start, end } = range;
     const params: (string | number)[] = [start, end];
     let filter = "";
     if (platform) { filter += " AND p.platform = ?"; params.push(platform); }
@@ -382,27 +602,29 @@ export class DashboardStore {
       params.push(...ids);
     }
     const rows = this.db.query<{
-      platform: Platform; day: string; average_cents: number; sample_count: number;
+      platform: Platform; bucket: string; average_cents: number; sample_count: number;
     }, (string | number)[]>(`
       WITH ranked AS (
-        SELECT p.platform, date(o.observed_at, '+8 hours') AS day, o.actual_price_cents,
+        SELECT p.platform, ${range.bucketExpression} AS bucket, o.actual_price_cents,
           ROW_NUMBER() OVER (
-            PARTITION BY o.product_id, date(o.observed_at, '+8 hours')
+            PARTITION BY o.product_id, ${range.bucketExpression}
             ORDER BY o.observed_at DESC, o.id DESC
           ) AS sample_rank
         FROM price_observations o JOIN products p ON p.id = o.product_id
         WHERE o.observed_at >= ? AND o.observed_at < ? ${filter}
       )
-      SELECT platform, day, AVG(actual_price_cents) AS average_cents, COUNT(*) AS sample_count
-      FROM ranked WHERE sample_rank = 1 GROUP BY platform, day
+      SELECT platform, bucket, AVG(actual_price_cents) AS average_cents, COUNT(*) AS sample_count
+      FROM ranked WHERE sample_rank = 1 GROUP BY platform, bucket
     `).all(...params);
-    const byDay = new Map(rows.map((row) => [`${row.platform}:${row.day}`, row]));
+    const byBucket = new Map(rows.map((row) => [`${row.platform}:${row.bucket}`, row]));
     return {
-      days,
+      range: range.range,
+      days: range.days,
+      hours: range.hours,
       series: (platform ? [platform] : ["taobao", "jd"] as Platform[]).map((source) => ({
         platform: source,
-        points: dates.map((date) => {
-          const row = byDay.get(`${source}:${date}`);
+        points: range.dates.map((date) => {
+          const row = byBucket.get(`${source}:${date}`);
           return {
             date,
             actual_price: row ? Math.round(row.average_cents) / 100 : null,
